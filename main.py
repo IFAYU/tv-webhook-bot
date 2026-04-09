@@ -10,9 +10,9 @@ app = FastAPI()
 # =========================
 # 基本設定
 # =========================
-SECRET = "abc123"
-SIM_MODE = True
-LOG_FILE = "trade_log.jsonl"
+SECRET = os.getenv("SECRET", "abc123")
+SIM_MODE = os.getenv("SIM_MODE", "true").lower() == "true"
+LOG_FILE = os.getenv("LOG_FILE", "trade_log.jsonl")
 
 # 交易設定
 OPEN_QTY = 2                   # 每次 BUY_OPEN 直接進 2 口微台
@@ -128,6 +128,9 @@ def build_result(payload: TVPayload, note: str = "") -> dict:
         },
     }
 
+@app.get("/")
+async def root():
+    return {"ok": True, "message": "tv-webhook-bot is running"}
 
 # =========================
 # 健康檢查
