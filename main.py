@@ -1,33 +1,52 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import json
 import os
 
 app = FastAPI()
 
 # =========================
+# 時區設定
+# =========================
+TW_TZ = timezone(timedelta(hours=8))
+
+def now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def utc_to_tw_str(utc_str: Optional[str]) -> Optional[str]:
+    if not utc_str:
+        return None
+    try:
+        dt = datetime.fromisoformat(utc_str.replace("Z", "+00:00"))
+        return dt.astimezone(TW_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return utc_str
+
+# =========================
 # 基本設定
 # =========================
-SECRET = os.getenv("SECRET", "abc123")
-SIM_MODE = os.getenv("SIM_MODE", "true").lower() == "true"
-LOG_FILE = os.getenv("LOG_FILE", "trade_log.jsonl")
+SECRET = "abc123"
+SIM_MODE = True
+LOG_FILE = "trade_log.jsonl"
 
 # 交易設定
-OPEN_QTY = 2                   # 每次 BUY_OPEN 直接進 2 口微台
-MAX_QTY = 4                    # 保留總上限設定（目前不加碼，先用不到）
+OPEN_QTY = 2
+MAX_QTY = 4
 
 # 風控設定
 BLOCK_DUPLICATE_ALERT = True
-DAILY_LOSS_LIMIT = -300.0      # 單日已實現虧損上限
-HARD_STOP_PER_CONTRACT = 100.0 # 每口硬停損點數
+DAILY_LOSS_LIMIT = -500.0
+HARD_STOP_PER_CONTRACT = 100.0
+MAX_CONSECUTIVE_LOSSES = 3
+ENABLE_STOP_LOSS_CHECK = True
 
 # 模擬帳戶
 INITIAL_CAPITAL = 1_000_000.0
 
 # =========================
-# 模擬持倉 / 帳戶狀態
+# 狀態
 # =========================
 state = {
     "mode": "SIM" if SIM_MODE else "LIVE",
@@ -36,6 +55,7 @@ state = {
     "avg_price": 0.0,
     "last_action_key": None,
     "last_signal_time": None,
+    "last_signal_time_tw": None,
     "initial_capital": INITIAL_CAPITAL,
     "realized_pnl": 0.0,
     "unrealized_pnl": 0.0,
@@ -43,11 +63,14 @@ state = {
     "peak_equity": INITIAL_CAPITAL,
     "max_drawdown": 0.0,
     "last_price": 0.0,
+    "consecutive_losses": 0,
+    "trading_locked": False,
+    "lock_reason": None,
     "position_history": [],
 }
 
 # =========================
-# TradingView payload
+# Payload
 # =========================
 class TVPayload(BaseModel):
     secret: str
@@ -58,10 +81,8 @@ class TVPayload(BaseModel):
     price: Optional[str] = None
     time: Optional[str] = None
 
-
 def make_action_key(data: TVPayload) -> str:
     return f"{data.action}|{data.symbol}|{data.timeframe}|{data.time}"
-
 
 def safe_float(v: Optional[str]) -> float:
     try:
@@ -69,11 +90,9 @@ def safe_float(v: Optional[str]) -> float:
     except Exception:
         return 0.0
 
-
 def log_event(event: dict):
     with open(LOG_FILE, "a", encoding="utf-8") as f:
         f.write(json.dumps(event, ensure_ascii=False) + "\n")
-
 
 def recalc_account_metrics(mark_price: float = 0.0):
     if mark_price > 0:
@@ -103,16 +122,33 @@ def recalc_account_metrics(mark_price: float = 0.0):
         if dd > state["max_drawdown"]:
             state["max_drawdown"] = round(dd, 4)
 
+def lock_trading(reason: str):
+    state["trading_locked"] = True
+    state["lock_reason"] = reason
+
+def check_risk_lock():
+    if state["realized_pnl"] <= DAILY_LOSS_LIMIT:
+        lock_trading(f"daily loss limit hit: {state['realized_pnl']}")
+        return True
+
+    if state["consecutive_losses"] >= MAX_CONSECUTIVE_LOSSES:
+        lock_trading(f"max consecutive losses hit: {state['consecutive_losses']}")
+        return True
+
+    return state["trading_locked"]
 
 def build_result(payload: TVPayload, note: str = "") -> dict:
+    received_utc = now_utc_iso()
     return {
-        "received_at": datetime.now().isoformat(),
+        "received_at": received_utc,
+        "received_at_tw": utc_to_tw_str(received_utc),
         "action": payload.action,
         "symbol": payload.symbol,
         "timeframe": payload.timeframe,
         "strategy": payload.strategy,
         "price": payload.price,
         "time": payload.time,
+        "time_tw": utc_to_tw_str(payload.time) if payload.time else None,
         "note": note,
         "state_snapshot": {
             "mode": state["mode"],
@@ -125,24 +161,25 @@ def build_result(payload: TVPayload, note: str = "") -> dict:
             "equity": state["equity"],
             "peak_equity": state["peak_equity"],
             "max_drawdown": state["max_drawdown"],
+            "consecutive_losses": state["consecutive_losses"],
+            "trading_locked": state["trading_locked"],
+            "lock_reason": state["lock_reason"],
+            "last_signal_time": state["last_signal_time"],
+            "last_signal_time_tw": state["last_signal_time_tw"],
         },
     }
 
+# =========================
+# API
+# =========================
 @app.get("/")
 async def root():
     return {"ok": True, "message": "tv-webhook-bot is running"}
 
-# =========================
-# 健康檢查
-# =========================
 @app.get("/health")
 async def health():
     return {"ok": True, "state": state}
 
-
-# =========================
-# 最近紀錄
-# =========================
 @app.get("/logs")
 async def logs():
     if not os.path.exists(LOG_FILE):
@@ -157,10 +194,6 @@ async def logs():
 
     return {"ok": True, "count": len(rows), "logs": rows[-20:]}
 
-
-# =========================
-# 手動重置
-# =========================
 @app.post("/reset")
 async def reset():
     global state
@@ -172,6 +205,7 @@ async def reset():
         "avg_price": 0.0,
         "last_action_key": None,
         "last_signal_time": None,
+        "last_signal_time_tw": None,
         "initial_capital": INITIAL_CAPITAL,
         "realized_pnl": 0.0,
         "unrealized_pnl": 0.0,
@@ -179,15 +213,14 @@ async def reset():
         "peak_equity": INITIAL_CAPITAL,
         "max_drawdown": 0.0,
         "last_price": 0.0,
+        "consecutive_losses": 0,
+        "trading_locked": False,
+        "lock_reason": None,
         "position_history": [],
     }
 
     return {"ok": True, "message": "state reset", "state": state}
 
-
-# =========================
-# Webhook 主入口
-# =========================
 @app.post("/tv-webhook")
 async def tv_webhook(payload: TVPayload):
     if payload.secret != SECRET:
@@ -197,10 +230,10 @@ async def tv_webhook(payload: TVPayload):
     action = payload.action
     price = safe_float(payload.price)
 
-    # 每次收到訊號先更新最新價格 / 未實現損益 / equity
+    # 先更新市價 / 帳戶
     recalc_account_metrics(price)
 
-    # 1) 同K同動作只允許一次
+    # 同K同動作只允許一次
     same_bar_same_action = (
         state["last_signal_time"] == payload.time
         and state["last_action_key"] is not None
@@ -215,21 +248,24 @@ async def tv_webhook(payload: TVPayload):
             "result": result,
         }
 
-    # 2) 日損上限
-    if state["realized_pnl"] <= DAILY_LOSS_LIMIT:
-        result = build_result(payload, "daily loss limit hit")
+    # 若已有持倉，先做停損檢查
+    if ENABLE_STOP_LOSS_CHECK and state["has_long"] and state["qty"] > 0:
+        stop_price = state["avg_price"] - HARD_STOP_PER_CONTRACT
+        if price > 0 and price <= stop_price:
+            action = "BUY_EXIT"
+
+    # 鎖單檢查：只鎖 BUY_OPEN，不鎖 BUY_EXIT
+    check_risk_lock()
+    if state["trading_locked"] and action == "BUY_OPEN":
+        result = build_result(payload, f"trading locked: {state['lock_reason']}")
         log_event(result)
         return {
             "ok": False,
-            "reason": "daily loss limit hit",
+            "reason": f"trading locked: {state['lock_reason']}",
             "result": result,
         }
 
-    # 3) 硬停損（持倉中即時計算）
-    if state["has_long"] and state["unrealized_pnl"] <= -(HARD_STOP_PER_CONTRACT * state["qty"]):
-        action = "BUY_EXIT"
-
-    # 4) 防重複 alert
+    # 防重複 alert
     if BLOCK_DUPLICATE_ALERT and state["last_action_key"] == action_key:
         result = build_result(payload, "duplicate alert ignored")
         log_event(result)
@@ -275,6 +311,7 @@ async def tv_webhook(payload: TVPayload):
         state["avg_price"] = round(price, 4)
         state["last_action_key"] = action_key
         state["last_signal_time"] = payload.time
+        state["last_signal_time_tw"] = utc_to_tw_str(payload.time)
 
         recalc_account_metrics(price)
 
@@ -284,6 +321,7 @@ async def tv_webhook(payload: TVPayload):
                 "qty": OPEN_QTY,
                 "price": round(price, 4),
                 "time": payload.time,
+                "time_tw": utc_to_tw_str(payload.time),
             }
         )
 
@@ -296,7 +334,7 @@ async def tv_webhook(payload: TVPayload):
             "result": result,
         }
 
-    # -------------------------
+   # -------------------------
     # BUY_ADD（停用）
     # -------------------------
     elif action == "BUY_ADD":
@@ -308,7 +346,7 @@ async def tv_webhook(payload: TVPayload):
             "result": result,
         }
 
-     # -------------------------
+    # -------------------------
     # BUY_EXIT
     # -------------------------
     elif action == "BUY_EXIT":
@@ -336,12 +374,18 @@ async def tv_webhook(payload: TVPayload):
 
         state["realized_pnl"] = round(state["realized_pnl"] + realized_pnl, 4)
 
+        if realized_pnl < 0:
+            state["consecutive_losses"] += 1
+        else:
+            state["consecutive_losses"] = 0
+
         state["position_history"].append(
             {
                 "action": "BUY_EXIT",
                 "qty": exit_qty,
                 "price": round(price, 4),
                 "time": payload.time,
+                "time_tw": utc_to_tw_str(payload.time),
                 "avg_price": round(exit_avg, 4),
                 "realized_pnl": realized_pnl,
             }
@@ -352,8 +396,10 @@ async def tv_webhook(payload: TVPayload):
         state["avg_price"] = 0.0
         state["last_action_key"] = action_key
         state["last_signal_time"] = payload.time
+        state["last_signal_time_tw"] = utc_to_tw_str(payload.time)
 
         recalc_account_metrics(price)
+        check_risk_lock()
 
         result = build_result(payload, f"SIM BUY_EXIT executed, pnl={realized_pnl}")
         log_event(result)
